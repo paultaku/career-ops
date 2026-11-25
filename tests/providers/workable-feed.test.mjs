@@ -16,7 +16,7 @@ const check = (ok, label, detail) => (ok ? pass(label) : fail(detail ? `${label}
 const cdata = (v) => `<![CDATA[${v}]]>`;
 
 /** One <job> element in the feed's own layout. */
-function job({ title, code, company = 'Acme GmbH', city = 'Berlin', state = 'Berlin', country = 'DE', remote = 'false', date = 'Mon, 09 Nov 2026 10:00:00 UTC', description = '<p>Build &amp; test.</p>', website = 'https://acme.example', url }) {
+function job({ title, code, company = 'Acme GmbH', city = 'Berlin', state = 'Berlin', country = 'DE', remote = 'false', date = 'Mon, 09 Nov 2026 10:00:00 UTC', description = '<p>Build &amp; test.</p>', website = 'https://acme.example', jobtype = 'Full-time', experience = '', url }) {
   const href = url ?? `https://apply.workable.com/j/${code}`;
   return `  <job>
     <title>
@@ -49,6 +49,12 @@ function job({ title, code, company = 'Acme GmbH', city = 'Berlin', state = 'Ber
     <description>
       ${cdata(description)}
     </description>
+    <jobtype>
+      ${cdata(jobtype)}
+    </jobtype>
+    <experience>
+      ${cdata(experience)}
+    </experience>
     <website>
       ${cdata(website)}
     </website>
@@ -88,6 +94,22 @@ const all = () => true;
   const row = feedRowToWidgetRow(job({ title: 'QA Engineer', code: 'ABC123', remote: 'true' }));
   check(row?.shortlink === 'https://apply.workable.com/j/ABC123' && row.country === 'Germany' && row.telecommuting === true && row.company === 'Acme GmbH', 'a feed row becomes a widget-shaped row');
   check(feedRowToWidgetRow(job({ title: '', code: 'X1' })) === null, 'a row with no title is dropped');
+}
+{
+  // Labels as the feed writes them (2026-11-22 sample: Full-time, Contract,
+  // Part-time, Other, Temporary, or empty on about one row in seven).
+  const typeOf = async (jobtype, experience) => {
+    const { companies } = await loadWorkableFeed({
+      cutoffMs: CUTOFF, titleFilter: all, fetchStream: streamOf(feed(job({ title: 'QA Engineer', code: 'ET1', jobtype, experience }))),
+    });
+    return companies[0]?.jobs[0]?.employmentType;
+  };
+  check(await typeOf('Contract') === 'contract' && await typeOf('Part-time') === 'part_time' && await typeOf('Full-time') === 'full_time',
+    'a feed posting carries the employment type its <jobtype> states');
+  check(await typeOf('') === undefined && await typeOf('Other') === undefined,
+    'an empty or "Other" <jobtype> leaves the employment type unknown');
+  check(await typeOf('Full-time', 'Internship') === 'internship' && await typeOf('Full-time', 'Mid-Senior level') === 'full_time',
+    'an <experience> of Internship makes the posting an internship; another level leaves <jobtype> in charge');
 }
 
 // ── splitting ───────────────────────────────────────────────────────────
@@ -143,6 +165,10 @@ const all = () => true;
   check(!companies.some((c) => c.jobs.some((j) => j.title === 'QA Intern')) && stats.undatedRows === 1, 'an undated row is dropped by default and counted');
   check(companies.map((c) => c.company).join('|') === 'Acme GmbH|ExampleCo' && acme.website === 'https://acme.example', 'postings are grouped per employer, sorted, with the website kept');
   check(stats.rows === 8 && stats.staleRows === 1 && stats.postings === 2, 'stats count rows read, stale rows and postings kept', JSON.stringify(stats));
+
+  const none = await loadWorkableFeed({ cutoffMs: CUTOFF, titleFilter: () => false, fetchStream: streamOf(text) });
+  check(none.companies.map((c) => `${c.company}:${c.jobs.length}`).join('|') === 'Acme GmbH:0|ExampleCo:0' && none.companies[0].website === 'https://acme.example',
+    'every employer in the feed is returned, with no postings when none passed', JSON.stringify(none.companies));
 
   const withUndated = await loadWorkableFeed({ cutoffMs: CUTOFF, includeUndated: true, titleFilter: all, fetchStream: streamOf(text) });
   check(withUndated.companies.some((c) => c.jobs.some((j) => j.title === 'QA Intern' && j.postedAt === undefined)), 'includeUndated keeps an undated posting, with no date');

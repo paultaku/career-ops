@@ -5,7 +5,7 @@
  *
  * career-ops never phones home, so the only signals the maintainers get are
  * the ones people choose to give. It asks for them in words, rarely, and at
- * the right moment (AGENTS.md → "Community asks"):
+ * the right moment (modes/_community-asks.md):
  *
  *   star       after the first saved evaluation report
  *   manifesto  after five reports, at least seven days after the star ask
@@ -241,7 +241,9 @@ export function readState(root, env = process.env, now = new Date()) {
 
 function openInBrowser(url) {
   const cmd = process.platform === 'darwin' ? 'open' : process.platform === 'win32' ? 'cmd' : 'xdg-open';
-  const args = process.platform === 'win32' ? ['/c', 'start', '', url] : [url];
+  // Carets keep cmd from ending the command at a `&` in the query, as in
+  // hired-share.mjs (escapeForCmd); these URLs have none today.
+  const args = process.platform === 'win32' ? ['/c', 'start', '', url.replace(/[&|<>^()]/g, '^$&')] : [url];
   // Bounded: on Linux xdg-open can hand the URL to a handler that waits, and the
   // agent's shell would hang after the user said yes. On timeout the URL is printed.
   try { execFileSync(cmd, args, { stdio: 'ignore', timeout: 10_000, windowsHide: true }); return true; } catch { return false; }

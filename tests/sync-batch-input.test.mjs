@@ -10,13 +10,13 @@ import { pass, fail, ROOT, SANDBOX_DATA_ROOT } from './helpers.mjs';
 import { join, sep } from 'path';
 import { pathToFileURL } from 'url';
 import { execFileSync } from 'child_process';
-import { mkdtempSync, rmSync, realpathSync, existsSync, writeFileSync } from 'fs';
+import { mkdtempSync, rmSync, realpathSync, existsSync, writeFileSync, readFileSync } from 'fs';
 
 console.log('\nsync-batch-input — pipeline "Pending" -> batch-input.tsv');
 
 try {
   const mod = await import(pathToFileURL(join(ROOT, 'sync-batch-input.mjs')).href);
-  const { parsePending, urlsFromTsv, maxTsvId, planBatchRows, buildNotes, lineUrl, lineCompany, extractLabels, isSafePublicHttpUrl } = mod;
+  const { parsePending, urlsFromTsv, maxTsvId, planBatchRows, buildNotes, lineUrl, lineCompany, extractLabels, isSafePublicHttpUrl, dropAggregatorDuplicates } = mod;
   const check = (label, cond) => (cond ? pass(label) : fail(label));
 
   // ── section-header matching (lib/pipeline-sections.mjs, shared with reconcile-pipeline) ──
@@ -142,6 +142,62 @@ try {
   check('embedded tabs/newlines are sanitized before TSV row construction', unsafeFieldRows[0].row === '3\thttps://fields.example/1\tpipeline\tline1 line2 line3');
   check('sanitized batch rows remain four columns', unsafeFieldRows[0].row.split('\t').length === 4);
 
+  // ── aggregator duplicates of a pending job (#7259) ──
+  const dedupe = (lines) => dropAggregatorDuplicates(parsePending(['## Pending', ...lines].join('\n'))).map((e) => e.url);
+  check('parsePending carries the title (third cell)', parsePending('## Pending\n- [ ] https://jobs.example.com/1 | Acme | Staff Engineer | Remote\n')[0].title === 'Staff Engineer');
+  check('a bare row has an empty title', parsePending('## Pending\n- [ ] https://jobs.example.com/2 | Acme\n')[0].title === '');
+  const withEmployer = dedupe([
+    '- [ ] https://www.linkedin.com/jobs/view/123 | Acme Inc. | Sr. Engineer',
+    '- [ ] https://jobs.example.com/acme/1 | acme inc | SR ENGINEER!',
+  ]);
+  check('an aggregator row is dropped next to an employer row for the same job', withEmployer.length === 1 && withEmployer[0] === 'https://jobs.example.com/acme/1');
+  const aggOnly = dedupe([
+    '- [ ] https://www.linkedin.com/jobs/view/1 | Acme | Engineer',
+    '- [ ] https://www.indeed.com/viewjob?jk=abc | Acme | Engineer',
+  ]);
+  check('an aggregator-only group keeps its first row', aggOnly.length === 1 && aggOnly[0] === 'https://www.linkedin.com/jobs/view/1');
+  const noKey = dedupe([
+    '- [ ] https://www.linkedin.com/jobs/view/5',
+    '- [ ] https://www.linkedin.com/jobs/view/6 | | Engineer',
+    '- [ ] https://www.linkedin.com/jobs/view/7 | Acme',
+    '- [ ] https://www.linkedin.com/jobs/view/8 | Acme',
+    '- [ ] https://jobs.example.com/acme/9 | Acme | Engineer',
+  ]);
+  check('rows with no company or no title are untouched', noKey.length === 5);
+  const diffTitle = dedupe([
+    '- [ ] https://www.linkedin.com/jobs/view/10 | Acme | Backend Engineer',
+    '- [ ] https://jobs.example.com/acme/11 | Acme | Frontend Engineer',
+  ]);
+  check('different titles at one company are both kept', diffTitle.length === 2);
+  const diffCompany = dedupe([
+    '- [ ] https://www.linkedin.com/jobs/view/12 | Acme | Engineer',
+    '- [ ] https://jobs.example.com/beta/13 | Beta | Engineer',
+  ]);
+  check('the same title at another company is kept', diffCompany.length === 2);
+  const employers = dedupe([
+    '- [ ] https://jobs.example.com/acme/14 | Acme | Engineer',
+    '- [ ] https://boards.example.org/acme/15 | Acme | Engineer',
+    '- [ ] https://www.linkedin.com/jobs/view/16 | Acme | Engineer',
+  ]);
+  check('two employer rows are both kept; only the aggregator row goes', employers.length === 2 && !employers.some((u) => new URL(u).hostname === 'www.linkedin.com'));
+  check('row order is preserved', dedupe([
+    '- [ ] https://jobs.example.com/z/1 | Zed | Role',
+    '- [ ] https://www.linkedin.com/jobs/view/2 | Zed | Role',
+    '- [ ] https://jobs.example.com/y/3 | Yar | Role',
+  ]).join() === 'https://jobs.example.com/z/1,https://jobs.example.com/y/3');
+
+  // Labeled segments (scan.mjs formatPipelineOffer, rank-pipeline.mjs) are not company/title cells.
+  const labeled = dedupe([
+    '- [ ] https://jobs.example.com/a/20 | posted: 2026-06-18 | trust: 80',
+    '- [ ] https://www.linkedin.com/jobs/view/21 | posted: 2026-06-18 | trust: 80',
+  ]);
+  check('labeled segments are not matched as company and title', labeled.length === 2);
+  const labeledTitle = dedupe([
+    '- [ ] https://jobs.example.com/a/22 | Acme | posted: 2026-06-18',
+    '- [ ] https://www.linkedin.com/jobs/view/23 | Acme | posted: 2026-06-18',
+  ]);
+  check('a labeled segment is not matched as a title', labeledTitle.length === 2);
+
   // ── SSRF: bracketed unspecified IPv6 address ──
   check('bracketed unspecified IPv6 ([::]) is rejected', !isSafePublicHttpUrl('http://[::]/'));
   check('bracketed unspecified IPv6 with port is rejected', !isSafePublicHttpUrl('http://[::]:8080/'));
@@ -242,6 +298,162 @@ try {
   ], new Set(), 30);
   check('null notes become empty in TSV', nullNotesRows[0].row === '30\thttps://nullnotes.example/1\tpipeline\t');
   check('undefined notes become empty in TSV', nullNotesRows[1].row === '31\thttps://nullnotes.example/2\tpipeline\t');
+
+  // ── --url queues one Pending row (#5269, the dashboard Inbox `e` key) ──
+  // Same normalization, dedupe, id allocation and row format as a full sync;
+  // only the selection differs.
+  const URL_TMP = realpathSync(mkdtempSync(join(SANDBOX_DATA_ROOT, 'sync-batch-input-url-')));
+  try {
+    const urlPipeline = join(URL_TMP, 'pipeline.md');
+    const urlInput = join(URL_TMP, 'batch-input.tsv');
+    const urlState = join(URL_TMP, 'batch-state.tsv');
+    const inputHeader = 'id\turl\tsource\tnotes\n4\thttps://jobs.example.com/acme/queued\tpipeline\t\n';
+    const stateBody = 'id\turl\tstatus\tstarted_at\tcompleted_at\treport_num\tscore\terror\tretries\n'
+      + '9\thttps://jobs.example.com/acme/done\tcompleted\t-\t-\t1\t4\t\t0\n';
+    writeFileSync(urlPipeline, [
+      '# Pipeline',
+      '## Pending',
+      '- [ ] https://jobs.example.com/acme/1 | Acme | Engineer | Remote | rank: 4.2/5 — strong fit',
+      '- [ ] https://JOBS.Example.com:443/acme/2 | Acme | Analyst',
+      '- [ ] https://jobs.example.com/acme/3 | Acme | Writer',
+      '- [ ] https://jobs.example.com/acme/queued | Acme | Queued',
+      '- [ ] https://jobs.example.com/acme/done | Acme | Done',
+      '- [x] https://jobs.example.com/acme/checked | Acme | Checked',
+      // The dashboard's reader lists these two rows; this script cannot read them.
+      '  - [ ] https://jobs.example.com/acme/indented | Acme | Indented',
+      '- [ ] Acme | https://jobs.example.com/acme/url-second | URL second',
+      '## Processed',
+      '- [x] https://jobs.example.com/acme/processed | Acme | Processed',
+      '',
+    ].join('\n'), 'utf-8');
+    const reset = () => {
+      writeFileSync(urlInput, inputHeader, 'utf-8');
+      writeFileSync(urlState, stateBody, 'utf-8');
+    };
+    const readInput = () => readFileSync(urlInput, 'utf-8');
+    const paths = ['--pipeline', urlPipeline, '--input', urlInput, '--state', urlState];
+
+    reset();
+    const one = runCli(['--url', 'https://jobs.example.com/acme/1', ...paths]);
+    const afterOne = readInput();
+    check('--url exits 0 for a Pending row', one.exitCode === 0);
+    check('--url appends only the selected row, with the next id, source and notes',
+      afterOne === inputHeader + '10\thttps://jobs.example.com/acme/1\tpipeline\trank: 4.2/5 — strong fit\n');
+    check('--url names batch/batch-runner.sh as the next step', /batch-runner\.sh/.test(one.stdout));
+
+    reset();
+    const eq = runCli(['--url=https://jobs.example.com/acme/3', ...paths]);
+    check('--url=value is read the same as the spaced form',
+      eq.exitCode === 0 && readInput() === inputHeader + '10\thttps://jobs.example.com/acme/3\tpipeline\t\n');
+
+    // The row is written https://JOBS.Example.com:443/acme/2; both sides are
+    // normalized with new URL().href, as a full sync normalizes every row.
+    reset();
+    const norm = runCli(['--url', 'https://jobs.example.com/acme/2', ...paths]);
+    check('--url matches a row whose URL differs only in host case and default port',
+      norm.exitCode === 0 && readInput() === inputHeader + '10\thttps://jobs.example.com/acme/2\tpipeline\t\n');
+    reset();
+    const normArg = runCli(['--url', 'HTTPS://jobs.EXAMPLE.com:443/acme/1', ...paths]);
+    check('--url normalizes its own argument the same way',
+      normArg.exitCode === 0 && readInput().endsWith('10\thttps://jobs.example.com/acme/1\tpipeline\trank: 4.2/5 — strong fit\n'));
+
+    // Exit 4 (URL_EXIT.NOT_PENDING) is how the dashboard tells this refusal
+    // apart from other failures, so its value is pinned here.
+    check('URL_EXIT values are pinned', mod.URL_EXIT.ALREADY_QUEUED === 3 && mod.URL_EXIT.NOT_PENDING === 4);
+    for (const [label, target] of [
+      ['a URL not in the pipeline', 'https://jobs.example.com/acme/missing'],
+      ['a checked Pending row', 'https://jobs.example.com/acme/checked'],
+      ['a Processed row', 'https://jobs.example.com/acme/processed'],
+      ['an indented row', 'https://jobs.example.com/acme/indented'],
+      ['a row whose URL is not the first cell', 'https://jobs.example.com/acme/url-second'],
+    ]) {
+      reset();
+      const r = runCli(['--url', target, ...paths]);
+      check(`--url with ${label} exits 4 and says the URL must come first`,
+        r.exitCode === 4 && /Not an unchecked Pending row/.test(r.stderr || '') && r.stderr.includes('first cell after "- [ ] "'));
+      check(`--url with ${label} writes nothing`, readInput() === inputHeader);
+    }
+
+    for (const [label, target] of [
+      ['a local: target', 'local:jds/acme-writer.md'],
+      ['a loopback URL', 'http://127.0.0.1/jobs/1'],
+      ['text that is not a URL', 'acme'],
+    ]) {
+      reset();
+      const r = runCli(['--url', target, ...paths]);
+      check(`--url refuses ${label} with exit 1`, r.exitCode === 1 && /--url must be a public http\(s\) URL/.test(r.stderr || ''));
+      check(`--url with ${label} writes nothing`, readInput() === inputHeader);
+    }
+
+    reset();
+    const missingPipeline = runCli(['--url', 'https://jobs.example.com/acme/1', '--pipeline', join(URL_TMP, 'absent.md'), '--input', urlInput, '--state', urlState]);
+    check('--url with no pipeline.md exits 4', missingPipeline.exitCode === 4 && /Not an unchecked Pending row/.test(missingPipeline.stderr || ''));
+
+    // acme/done is only in batch-state.tsv: the dashboard shows it with no
+    // status, so exit 3 is the only thing that tells it nothing was queued.
+    for (const [label, target] of [
+      ['batch-input.tsv', 'https://jobs.example.com/acme/queued'],
+      ['batch-state.tsv only', 'https://jobs.example.com/acme/done'],
+    ]) {
+      reset();
+      const r = runCli(['--url', target, ...paths]);
+      check(`--url on a row already in ${label} is a no-op that exits 3`,
+        r.exitCode === 3 && /already in batch-input\.tsv or batch-state\.tsv — nothing to queue/.test(r.stdout));
+      check(`--url on a row already in ${label} writes nothing`, readInput() === inputHeader);
+    }
+
+    reset();
+    const twice = [runCli(['--url', 'https://jobs.example.com/acme/1', ...paths]), runCli(['--url', 'https://jobs.example.com/acme/1', ...paths])];
+    check('--url run twice queues the row once, and the second run exits 3',
+      twice[0].exitCode === 0 && twice[1].exitCode === 3 && readInput().split('acme/1\t').length === 2);
+
+    reset();
+    const dry = runCli(['--dry-run', '--url', 'https://jobs.example.com/acme/3', ...paths]);
+    // Compare the listed URLs as whole tokens, not substrings of the output.
+    const dryUrls = dry.stdout.match(/https?:\/\/[^\s|]+/g) ?? [];
+    check('--dry-run with --url lists only the selected row',
+      dry.exitCode === 0 && dryUrls.length > 0 && dryUrls.every((u) => u === 'https://jobs.example.com/acme/3')
+        && /dry-run — no changes written/.test(dry.stdout));
+    check('--dry-run with --url writes nothing', readInput() === inputHeader);
+    const dryMissing = runCli(['--dry-run', '--url', 'https://jobs.example.com/acme/missing', ...paths]);
+    check('--dry-run with --url still refuses a row that is not Pending', dryMissing.exitCode === 4);
+
+    rmSync(urlInput, { force: true });
+    const fresh = runCli(['--url', 'https://jobs.example.com/acme/1', ...paths]);
+    check('--url creates batch-input.tsv with its header when it is missing',
+      fresh.exitCode === 0 && readInput().startsWith('# batch-input.tsv') && readInput().endsWith('10\thttps://jobs.example.com/acme/1\tpipeline\trank: 4.2/5 — strong fit\n'));
+
+    check('--url without a value exits with error', runCli(['--url', '--dry-run', ...paths]).exitCode !== 0);
+    check('--url= with an empty value exits with error', runCli(['--url=', '--dry-run', ...paths]).exitCode !== 0);
+
+    // ── aggregator duplicates through the CLI (#7259) ──
+    const aggPipeline = join(URL_TMP, 'agg.md');
+    const aggInput = join(URL_TMP, 'agg-input.tsv');
+    writeFileSync(aggPipeline, [
+      '## Pending',
+      '- [ ] https://www.linkedin.com/jobs/view/77 | Acme | Engineer',
+      '- [ ] https://jobs.example.com/acme/77 | Acme | Engineer',
+    ].join('\n') + '\n', 'utf-8');
+    const queuedUrls = (file) => readFileSync(file, 'utf-8').split('\n')
+      .filter((l) => l && !l.startsWith('#')).map((l) => l.split('\t')[1]);
+    const aggRun = runCli(['--pipeline', aggPipeline, '--input', aggInput, '--state', urlState]);
+    check('a full sync queues the employer row and drops its aggregator duplicate',
+      aggRun.exitCode === 0 && /1 aggregator duplicate/.test(aggRun.stdout)
+      && queuedUrls(aggInput).length === 1
+      && queuedUrls(aggInput)[0] === 'https://jobs.example.com/acme/77');
+    rmSync(aggInput, { force: true });
+    const aggUrl = runCli(['--url', 'https://www.linkedin.com/jobs/view/77', '--pipeline', aggPipeline, '--input', aggInput, '--state', urlState]);
+    check('--url on an aggregator row still queues it', aggUrl.exitCode === 0 && queuedUrls(aggInput).some((u) => u === 'https://www.linkedin.com/jobs/view/77'));
+
+    // A full sync with nothing to add still exits 0: the exit codes are --url only.
+    writeFileSync(urlInput, 'id\turl\n1\thttps://only.example.com/1\n', 'utf-8');
+    const onlyPipeline = join(URL_TMP, 'only.md');
+    writeFileSync(onlyPipeline, '## Pending\n- [ ] https://only.example.com/1 | Acme | Role\n', 'utf-8');
+    const fullNoop = runCli(['--pipeline', onlyPipeline, '--input', urlInput, '--state', urlState]);
+    check('a full sync with nothing to add still exits 0', fullNoop.exitCode === 0 && /nothing to sync/.test(fullNoop.stdout));
+  } finally {
+    rmSync(URL_TMP, { recursive: true, force: true });
+  }
 } catch (err) {
   fail(`sync-batch-input test suite threw: ${err?.message ?? err}`);
 }

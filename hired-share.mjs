@@ -34,6 +34,7 @@ import { isMainModule } from './lib/is-main-module.mjs';
 import { parseTrackerRow, resolveColumns, isSeparatorRow, isHeaderRow, parseMarkdownLinks, extractTrackerReportNumbers } from './tracker-parse.mjs';
 import { resolveTrackerPath, resolveWorkspaceRoot, writeFileAtomic, acquireTrackerLock, loadCanonicalStates, resolveCanonicalStateId } from './tracker-utils.mjs';
 import { getCareerOpsRoot } from './path-resolver.mjs';
+import { parsedScanHistory } from './lib/scan-history-columns.mjs';
 import { fileURLToPath } from 'url';
 
 // System-layer states.yml resolves from the codebase, not the data root (#3500).
@@ -283,10 +284,11 @@ export function hiredRows(trackerText) {
  */
 export function weeksFromScanHistory(scanHistoryText, endIso) {
   if (!scanHistoryText || !endIso) return null;
+  // first_seen is the second column (url first), so read it by name: a match
+  // anchored at the start of the line found no date in any real file.
   let earliest = null;
-  for (const line of scanHistoryText.split('\n')) {
-    const m = line.match(/^(\d{4}-\d{2}-\d{2})\t/);
-    if (m && (!earliest || m[1] < earliest)) earliest = m[1];
+  for (const { first_seen: seen } of parsedScanHistory(scanHistoryText)) {
+    if (/^\d{4}-\d{2}-\d{2}$/.test(seen) && (!earliest || seen < earliest)) earliest = seen;
   }
   if (!earliest) return null;
   const ms = new Date(`${endIso}T12:00:00Z`) - new Date(`${earliest}T12:00:00Z`);
@@ -316,10 +318,53 @@ export function buildIssueUrl({ role, companyType, story, feature, timeToHire, a
   return `${REPO_URL}/issues/new?${q.toString()}`;
 }
 
-function openInBrowser(url) {
+/**
+ * How long the OS opener may take before it is killed.
+ *
+ * The opener is fire-and-forget: its only jobs are "start the handler" and
+ * report whether it started. `cmd /c start` on Windows returns immediately for
+ * a URL whose handler exists, and blocks while the shell resolves one that does
+ * not; an unbounded wait there is a CLI that appears to freeze after it has
+ * already printed everything the user needs.
+ */
+export const OPENER_TIMEOUT_MS = 15_000;
+
+/**
+ * Escape a URL for `cmd /c start`.
+ *
+ * cmd reads its whole command line before `start` runs, and an unescaped `&`
+ * ends the command there: the prefilled issue URL joins its fields with `&`,
+ * so `start` got only the template and cmd ran `title=…`, `role=…` as
+ * commands of their own. A caret makes cmd take the next character literally.
+ * Node passes the argument unquoted (a serialized URL has no space or `"`),
+ * so the carets reach cmd and none of them reach the browser.
+ *
+ * @param {string} url
+ * @returns {string}
+ */
+export function escapeForCmd(url) {
+  return url.replace(/[&|<>^()]/g, '^$&');
+}
+
+/**
+ * Hand a URL to the platform's opener.
+ *
+ * `exec` is a seam so a test can assert the bound without opening a browser.
+ * Failure is `false`, never a throw: every caller prints the URL as a fallback.
+ *
+ * @param {string} url
+ * @param {typeof execFileSync} [exec]
+ * @returns {boolean} whether the opener was started
+ */
+export function openInBrowser(url, exec = execFileSync) {
   const cmd = process.platform === 'darwin' ? 'open' : process.platform === 'win32' ? 'cmd' : 'xdg-open';
-  const args = process.platform === 'win32' ? ['/c', 'start', '', url] : [url];
-  try { execFileSync(cmd, args, { stdio: 'ignore' }); return true; } catch { return false; }
+  const args = process.platform === 'win32' ? ['/c', 'start', '', escapeForCmd(url)] : [url];
+  try {
+    // windowsHide: `cmd /c start` otherwise flashes a console window over
+    // whatever the user is looking at.
+    exec(cmd, args, { stdio: 'ignore', timeout: OPENER_TIMEOUT_MS, windowsHide: true });
+    return true;
+  } catch { return false; }
 }
 
 async function main() {

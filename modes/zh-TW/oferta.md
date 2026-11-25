@@ -297,7 +297,7 @@
 ## Risk Summary
 (每個風險訊號一列，順序固定 —— 見上文 Risk Summary 一節)
 
-## H) 開放式問題擬答草稿
+## H) 開放式問題擬答草稿 (draft)
 (僅在綜合評分 >= 4.5 且應徵表單有問答框時產生)
 
 ---
@@ -306,7 +306,7 @@
 (列出 15–20 個從該 JD 中擷取的高頻核心技術／業務關鍵字，用於履歷最佳化)
 
 ## Keyword Coverage
-（由 `keyword-match.mjs` (1b) 產生——覆蓋率 %、present、thin、missing）
+（由 `keyword-match.mjs` (1b) 產生——覆蓋率 %、present、missing）
 
 ## Job Description (archived verbatim)
 （職缺描述全文，逐字貼上——見下方要求）

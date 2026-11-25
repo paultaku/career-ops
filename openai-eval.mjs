@@ -3,7 +3,7 @@
  * openai-eval.mjs — OpenAI-compatible Job Offer Evaluator for career-ops
  *
  * Evaluate job offers with ANY OpenAI-compatible chat endpoint instead of Claude.
- * Works with OpenAI, OpenRouter, Requesty, Cheaper Inference, API Route, Runcrate, CloudGPU, cheapaimodel, UberLLM, Standard Compute, Together, Groq, DeepSeek, Zhipu GLM,
+ * Works with OpenAI, OpenRouter, Requesty, Cheaper Inference, API Route, Runcrate, CloudGPU, cheapaimodel, UberLLM, Standard Compute, onomeo, Together, Groq, DeepSeek, Zhipu GLM,
  * MiniMax, Fireworks, and local servers that speak the OpenAI API (LM Studio, llama.cpp,
  * vLLM, Ollama's /v1). Point it at a base URL + model + key and go.
  *
@@ -41,12 +41,13 @@ import {
 } from './reserve-report-num.mjs';
 import { TokenAccumulator, formatBreakdown, normalizeOpenAIUsage } from './utils/token-tracker.mjs';
 import { buildBudgetedPrompt } from './lib/context-budget.mjs';
-import { endpointHeaders } from './lib/endpoint-headers.mjs';
+import { endpointHeaders, buildTokenLimit } from './lib/endpoint-headers.mjs';
 import { assertLlmRequestAllowed } from './lib/llm-outbound.mjs';
 import { installPiiInterceptor } from './lib/pii-interceptor.mjs';
 import {
   isPostingUrl, normalizedTrackerScore, parseScoreSummary, slugifyCompany, tsvSafe,
 } from './lib/tracker-addition.mjs';
+import { NO_INVENTED_PAY_RULE, normalizeEvaluationText } from './lib/eval-evidence.mjs';
 
 // Ambient guard over global fetch (idempotent); the explicit gate below is the
 // primary layer, this covers anything the script hands to fetch directly.
@@ -133,6 +134,7 @@ if (args.length === 0 || args[0] === '--help' || args[0] === '-h') {
     cheapaimodel: --url https://api.cheapaimodel.ai/v1  --model deepseek-v4-1-flash
     UberLLM:     --url https://api.uberllm.dev/v1  --model deepseek/deepseek-v4-flash
     Standard Compute: --url https://api.stdcmpt.com/v1  --model StandardCompute
+    onomeo:      --url https://onomeo.com/v1  --model deepseek-v4.1-flash
     Together:    --url https://api.together.xyz/v1     --model meta-llama/Llama-3.3-70B-Instruct-Turbo
     Groq:        --url https://api.groq.com/openai/v1  --model llama-3.3-70b-versatile
     DeepSeek:    --url https://api.deepseek.com/v1     --model deepseek-chat
@@ -327,7 +329,7 @@ ${contextBody}
 IMPORTANT OPERATING RULES FOR THIS SESSION
 ═══════════════════════════════════════════════════════
 1. You do NOT have access to WebSearch, Playwright, or file writing tools.
-   - Block D (Comp research): use training-data salary estimates; note them as estimates.
+   - ${NO_INVENTED_PAY_RULE}
    - Block G (Legitimacy): analyze JD text only; skip URL/page freshness checks.
    - Post-evaluation file saving is handled by the script, not by you.
 2. ${languageInstruction}
@@ -372,11 +374,24 @@ export function buildSystemMessage(prompt, host) {
 // bounds the reservation without cutting a normal evaluation short.
 const DEFAULT_MAX_TOKENS = 32768;
 
-// Same host gate as buildSystemMessage: api.openai.com's reasoning models
-// reject `max_tokens` and take `max_completion_tokens`, which its other chat
-// models accept as well; gateways and local servers read `max_tokens`.
-function buildTokenLimit(limit, host) {
-  return host === 'api.openai.com' ? { max_completion_tokens: limit } : { max_tokens: limit };
+// ---------------------------------------------------------------------------
+// Ending a run after a request
+// ---------------------------------------------------------------------------
+// Once a request has been made, the run ends by setting the exit code and
+// letting the event loop drain, not with process.exit(). On Windows, some Node
+// versions can abort in process.exit() after a request (nodejs/node#56645), and
+// the run then ends with exit code 3221226505 instead of 1; ollama-eval.mjs has
+// the versions and the measurement (#7096).
+//
+// This is top-level code, so the caller awaits the promise returned here. It
+// never settles, so nothing after the await runs, and Node exits with
+// process.exitCode once nothing else is pending: an exit code that is already
+// set wins over the unsettled-await code 13. The unref'd timer still ends a run
+// that something holds open, without holding the process open itself.
+function exitWhenDrained(code) {
+  process.exitCode = code;
+  setTimeout(() => process.exit(code), 5_000).unref();
+  return new Promise(() => {});
 }
 
 // ---------------------------------------------------------------------------
@@ -416,6 +431,7 @@ if (apiKey) headers['Authorization'] = `Bearer ${apiKey}`;
 Object.assign(headers, endpointHeaders(endpointHost, SESSION_ID, careerOpsVersion));
 
 let evaluationText;
+let evaluationUsage = null;
 try {
   // Privacy gate: inspect the complete serialized request before it leaves the
   // machine. Shared boundary so openai-eval and openai-tailor cannot diverge.
@@ -455,7 +471,11 @@ try {
 
   if (!res.ok) {
     console.error(`❌  API error: HTTP ${res.status}`);
-    console.error(`    ${body.slice(0, 300)}`);
+    // The body is the gateway's own text, and the one place this request's key
+    // can come back out. gemini-eval.mjs redacts its key from error text the
+    // same way; redact before truncating so a long key cannot survive in pieces.
+    const shown = apiKey ? body.split(apiKey).join('[REDACTED]') : body;
+    console.error(`    ${shown.slice(0, 300)}`);
     if (res.status === 401 || res.status === 403) {
       console.error(`    → Check your API key for ${endpointHost}.`);
     } else if (res.status === 402) {
@@ -464,55 +484,100 @@ try {
     } else if (res.status === 404) {
       console.error(`    → Check --url (it should include any /v1 segment) and --model id.`);
     }
-    process.exit(1);
+    await exitWhenDrained(1);
   }
 
-  // SSE-Zeilen akkumulieren: content + reasoning_content getrennt
+  // Keep transport EOF distinct from a successfully completed generation.
   const parts = [];
   const reader = res.body.getReader();
-  const decoder = new TextDecoder();
+  const decoder = new TextDecoder('utf-8', { fatal: true });
+  // Bound each decoded line and joined event to 1 Mi UTF-16 code units, not the
+  // transport chunk or total reply: a chunk may contain many small events.
+  const recordLimit = 1024 * 1024;
   let sseBuf = '';
   let thinkOpen = false;
-  let streamUsage;
+  let streamDone = false;
   let finishReason = null;
-  while (true) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    sseBuf += decoder.decode(value, { stream: true });
-    let nl;
-    while ((nl = sseBuf.indexOf('\n')) >= 0) {
-      const line = sseBuf.slice(0, nl).trim();
-      sseBuf = sseBuf.slice(nl + 1);
-      if (!line.startsWith('data:')) continue;
-      const payload = line.slice(5).trim();
-      if (payload === '[DONE]') continue;
-      let delta;
-      try { delta = JSON.parse(payload); } catch { continue; }
-      streamUsage = delta.usage ?? delta.x_groq?.usage ?? streamUsage;
-      finishReason = delta.choices?.[0]?.finish_reason ?? finishReason;
-      const d = delta.choices?.[0]?.delta ?? {};
-      if (d.reasoning_content) {
-        if (!thinkOpen) { parts.push('\n<think>\n'); thinkOpen = true; }
-        parts.push(d.reasoning_content);
-      } else {
-        if (thinkOpen) { parts.push('\n</think>\n\n'); thinkOpen = false; }
-        if (d.content) parts.push(d.content);
+  let answer = '';
+  let eventData = [];
+  let eventSize = 0;
+  const consumeEvent = () => {
+    if (!eventData.length) return;
+    const payload = eventData.join('\n').trim();
+    eventData = [];
+    eventSize = 0;
+    if (payload === '[DONE]') { streamDone = true; return; }
+    const obj = JSON.parse(payload);
+    if (obj.error) throw new Error(String(obj.error.message || obj.error).slice(0, 300));
+    // Some compatible endpoints report running totals or Groq-shaped usage.
+    // Keep the latest complete counts, including a genuine measured zero.
+    const usage = obj.usage ?? obj.x_groq?.usage;
+    if (Number.isFinite(usage?.prompt_tokens) && usage.prompt_tokens >= 0
+        && Number.isFinite(usage?.completion_tokens) && usage.completion_tokens >= 0) {
+      evaluationUsage = {
+        ...usage,
+        total_tokens: usage.total_tokens ?? usage.prompt_tokens + usage.completion_tokens,
+      };
+    }
+    const choice = obj.choices?.[0];
+    if (choice?.finish_reason != null) {
+      finishReason = choice.finish_reason;
+      if (finishReason === 'length') {
+        console.error(`⚠️   The reply stopped at the ${maxTokens}-token output cap, so the evaluation may be truncated (missing blocks or score summary).`);
+        console.error(`    Raise CAREER_OPS_MAX_TOKENS to allow a longer reply.`);
+      }
+      if (finishReason !== 'stop') throw new Error(`Incomplete evaluation: finish_reason=${finishReason}`);
+    }
+    const d = choice?.delta ?? {};
+    if (d.tool_calls?.length || d.function_call) {
+      throw new Error('The endpoint returned an unsupported tool call instead of an evaluation.');
+    }
+    if (d.reasoning_content) {
+      if (!thinkOpen) { parts.push('\n<think>\n'); thinkOpen = true; }
+      parts.push(d.reasoning_content);
+    }
+    if (d.content) {
+      if (thinkOpen) { parts.push('\n</think>\n\n'); thinkOpen = false; }
+      parts.push(d.content);
+      answer += d.content;
+    }
+  };
+  const consumeLine = line => {
+    if (line.length > recordLimit) throw new Error('Stream line exceeds the 1 Mi code-unit limit');
+    line = line.replace(/\r$/, '');
+    if (!line) consumeEvent();
+    else if (line.startsWith('data:')) {
+      const data = line.slice(5).replace(/^ /, '');
+      eventSize += data.length + (eventData.length ? 1 : 0);
+      if (eventSize > recordLimit) throw new Error('Stream event exceeds the 1 Mi code-unit limit');
+      eventData.push(data);
+    }
+  };
+  try {
+    while (!streamDone) {
+      const { done, value } = await reader.read();
+      sseBuf += done ? decoder.decode() : decoder.decode(value, { stream: true });
+      let nl;
+      while (!streamDone && (nl = sseBuf.indexOf('\n')) >= 0) {
+        consumeLine(sseBuf.slice(0, nl));
+        sseBuf = sseBuf.slice(nl + 1);
+      }
+      if (!streamDone && sseBuf.length > recordLimit) throw new Error('Stream line exceeds the 1 Mi code-unit limit');
+      if (done) {
+        if (sseBuf) consumeLine(sseBuf);
+        consumeEvent();
+        break;
       }
     }
+  } finally {
+    await reader.cancel().catch(() => {});
+    reader.releaseLock();
   }
+  if (!streamDone && finishReason !== 'stop') throw new Error('Incomplete evaluation: stream ended before completion');
+  if (!answer.trim()) throw new Error('The endpoint returned an empty response.');
   if (thinkOpen) parts.push('\n</think>\n');
-  if (streamUsage) tracker.record('evaluation', normalizeOpenAIUsage(streamUsage));
   evaluationText = parts.join('').trim();
-  // Before the empty check: a thinking model can spend the whole cap on
-  // reasoning, and then this is the only explanation the user gets.
-  if (finishReason === 'length') {
-    console.error(`⚠️   The reply stopped at the ${maxTokens}-token output cap, so the evaluation may be truncated (missing blocks or score summary).`);
-    console.error(`    Raise CAREER_OPS_MAX_TOKENS to allow a longer reply.`);
-  }
-  if (!evaluationText) {
-    console.error('❌  The endpoint returned an empty response.');
-    process.exit(1);
-  }
+  if (evaluationUsage) tracker.record('evaluation', normalizeOpenAIUsage(evaluationUsage));
 } catch (err) {
   if (err.name === 'TimeoutError') {
     console.error(`❌  Request timed out after ${Math.round(timeoutMs / 1000)}s.`);
@@ -520,12 +585,14 @@ try {
   } else {
     console.error(`❌  API call failed: ${err.message}`);
   }
-  process.exit(1);
+  await exitWhenDrained(1);
 }
 
 // ---------------------------------------------------------------------------
 // Display evaluation
 // ---------------------------------------------------------------------------
+evaluationText = normalizeEvaluationText(evaluationText, jdText);
+
 console.log('\n' + '═'.repeat(66));
 console.log('  CAREER-OPS EVALUATION — powered by ' + modelName + ' (' + endpointHost + ')');
 console.log('═'.repeat(66) + '\n');
@@ -648,4 +715,6 @@ console.log('\n' + '─'.repeat(66));
 console.log(`  Score: ${score}/5  |  Archetype: ${archetype}  |  Legitimacy: ${legitimacy}`);
 console.log('─'.repeat(66) + '\n');
 
-console.log(formatBreakdown(tracker, modelName, 'openai'));
+console.log(evaluationUsage
+  ? formatBreakdown(tracker, modelName, 'openai')
+  : `Token breakdown:\n  evaluation:    usage unavailable (endpoint did not report token counts)\n  (metadata: model=${modelName}, provider=openai)`);

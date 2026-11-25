@@ -235,7 +235,7 @@ I nomi dei campi dell'intestazione (`Date`, `URL`, `Archetype`, `Score`, `Legiti
 ## Score Evidence
 (cinque dimensioni, stato dell'evidenza, domande aperte, Evidence confidence, priorità)
 
-## H) Bozze di risposta per la candidatura
+## H) Bozze di risposta per la candidatura (draft)
 (solo se punteggio >= 4.5 -- risposte pronte per i moduli del portale aziendale)
 
 ---
@@ -244,7 +244,7 @@ I nomi dei campi dell'intestazione (`Date`, `URL`, `Archetype`, `Score`, `Legiti
 (15-20 parole chiave estratte dall'annuncio per il superamento dei filtri ATS)
 
 ## Keyword Coverage
-(generato da `keyword-match.mjs` (1b) -- copertura in %, present, thin, missing)
+(generato da `keyword-match.mjs` (1b) -- copertura in %, present, missing)
 
 ## Job Description (archived verbatim)
 (il testo completo dell'annuncio, incollato alla lettera -- vedi il requisito più sotto)

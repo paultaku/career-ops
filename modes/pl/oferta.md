@@ -235,7 +235,7 @@ Nazwy pól w nagłówku (`Date`, `URL`, `Archetype`, `Score`, `Legitimacy`, `PDF
 ## Score Evidence
 (pięć wymiarów, status dowodu, otwarte pytania, Evidence confidence, priorytety)
 
-## H) Szkice odpowiedzi do aplikacji
+## H) Szkice odpowiedzi do aplikacji (draft)
 (tylko jeśli score >= 4.5 -- szkice odpowiedzi do formularza aplikacyjnego)
 
 ---
@@ -244,7 +244,7 @@ Nazwy pól w nagłówku (`Date`, `URL`, `Archetype`, `Score`, `Legitimacy`, `PDF
 (lista 15-20 słów kluczowych z oferty do optymalizacji ATS)
 
 ## Keyword Coverage
-(generowane przez `keyword-match.mjs` (1b) -- pokrycie w %, present, thin, missing)
+(generowane przez `keyword-match.mjs` (1b) -- pokrycie w %, present, missing)
 
 ## Job Description (archived verbatim)
 (pełny tekst oferty, wklejony dosłownie -- zobacz wymaganie poniżej)

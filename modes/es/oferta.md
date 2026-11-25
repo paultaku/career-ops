@@ -419,7 +419,7 @@ Guardar la evaluación completa en `reports/{###}-{company-slug}-{YYYY-MM-DD}.md
 ## Risk Summary
 (una fila por señal de riesgo, orden fijo — ver la sección Risk Summary arriba)
 
-## H) Borradores de respuestas para la candidatura
+## H) Borradores de respuestas para la candidatura (draft)
 (solo si score >= 4.5 — borradores de respuestas para el formulario)
 
 ---
@@ -428,7 +428,7 @@ Guardar la evaluación completa en `reports/{###}-{company-slug}-{YYYY-MM-DD}.md
 (lista de 15-20 palabras clave de la oferta para optimización ATS)
 
 ## Keyword Coverage
-(generado por `keyword-match.mjs` (1b) — cobertura en %, present, thin, missing)
+(generado por `keyword-match.mjs` (1b) — cobertura en %, present, missing)
 
 ## Job Description (archived verbatim)
 (el texto completo de la oferta, pegado tal cual — ver el requisito más abajo)

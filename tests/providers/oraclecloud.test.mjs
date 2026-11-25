@@ -291,6 +291,82 @@ try {
     fail('parseOracleResponse should be empty-safe on malformed bodies');
   }
 
+  // ── secondaryLocations: every place a requisition is open in ────────
+  // buildApiUrl() expands requisitionList.secondaryLocations, where a
+  // requisition open in several places lists the ones besides its
+  // PrimaryLocation, each with its own Name (seen on JPMorgan Chase and Uber
+  // boards). Reading PrimaryLocation alone dropped them, so a location_filter
+  // that names only a secondary place rejected the posting.
+  const multiSample = {
+    items: [{
+      requisitionList: [
+        {
+          Id: '1001',
+          Title: 'Machine Learning Engineer',
+          PrimaryLocation: 'Sunnyvale, CA, United States',
+          secondaryLocations: [
+            { Name: 'San Francisco, CA, United States', CountryCode: 'US' },
+            { Name: 'Seattle, WA, United States', CountryCode: 'US' },
+            { Name: 'Sunnyvale, CA, United States', CountryCode: 'US' },
+            { Name: ' ', CountryCode: 'US' },
+            { CountryCode: 'US' },
+            null,
+          ],
+        },
+        {
+          Id: '1002',
+          Title: 'Operations Manager',
+          PrimaryLocation: 'Paris, Ile-de-France, France',
+          WorkplaceTypeCode: 'ORA_HYBRID',
+          secondaryLocations: [{ Name: 'Madrid, Spain', CountryCode: 'ES' }],
+        },
+        { Id: '1003', Title: 'Client Associate', PrimaryLocation: 'Newark, DE, United States', secondaryLocations: [] },
+        {
+          Id: '1004',
+          Title: 'Support Engineer',
+          PrimaryLocation: 'Austin, TX, United States',
+          secondaryLocations: [{ Name: 'Remote', CountryCode: 'US' }],
+        },
+      ],
+    }],
+  };
+  const [multi, hybrid, single, workModel] = parseOracleResponse(multiSample, site, 'Acme');
+
+  if (multi?.location === 'Sunnyvale, CA, United States · San Francisco, CA, United States · Seattle, WA, United States'
+      && JSON.stringify(multi?.locations) === JSON.stringify(['Sunnyvale, CA, United States', 'San Francisco, CA, United States', 'Seattle, WA, United States'])) {
+    pass('parseOracleResponse adds each secondary location once, after the primary one');
+  } else {
+    fail(`multi-location row = location: ${JSON.stringify(multi?.location)}, locations: ${JSON.stringify(multi?.locations)}`);
+  }
+
+  if (hybrid?.location === 'Paris, Ile-de-France, France · Madrid, Spain · Hybrid'
+      && JSON.stringify(hybrid?.locations) === JSON.stringify(['Paris, Ile-de-France, France', 'Madrid, Spain'])) {
+    pass('parseOracleResponse puts the work-model hint after every place and leaves it out of locations');
+  } else {
+    fail(`hybrid row = location: ${JSON.stringify(hybrid?.location)}, locations: ${JSON.stringify(hybrid?.locations)}`);
+  }
+
+  if (single?.location === 'Newark, DE, United States'
+      && JSON.stringify(single?.locations) === JSON.stringify(['Newark, DE, United States'])) {
+    pass('parseOracleResponse keeps the location of a requisition with no secondary locations');
+  } else {
+    fail(`single-location row = location: ${JSON.stringify(single?.location)}, locations: ${JSON.stringify(single?.locations)}`);
+  }
+
+  if (workModel?.location === 'Austin, TX, United States · Remote'
+      && JSON.stringify(workModel?.locations) === JSON.stringify(['Austin, TX, United States'])) {
+    pass('parseOracleResponse keeps a work-model-only secondary name out of locations');
+  } else {
+    fail(`work-model row = location: ${JSON.stringify(workModel?.location)}, locations: ${JSON.stringify(workModel?.locations)}`);
+  }
+
+  const { buildLocationFilter } = await import(pathToFileURL(join(ROOT, 'scan.mjs')).href);
+  if (buildLocationFilter({ allow: ['Seattle'] })(multi?.location, multi?.url, multi?.title)) {
+    pass('location_filter allow: [Seattle] keeps a requisition whose secondary location is Seattle');
+  } else {
+    fail(`location_filter allow: [Seattle] rejected ${JSON.stringify(multi?.location)}`);
+  }
+
   // ── fetch: normalization + redirect:error + trusted host ────────────
   let capturedUrl = null;
   let capturedOpts = null;
@@ -581,15 +657,53 @@ try {
     try { return { result: await fn(), lines }; } finally { console.error = orig; }
   };
 
+  // No max_pages and a reported total: the default follows the total, so the
+  // whole board is read and nothing is cut.
   const defCount = { n: 0 };
   const def = await captureWarn(() => oc.fetch({ name: 'JPMC', careers_url: careers }, pagedCtx(7118, defCount)));
-  if (def.result.length === 5000 && defCount.n === 25) pass('oraclecloud.fetch() default behaviour unchanged: 25 pages, 5000 jobs');
-  else fail(`default cap: ${def.result.length} jobs in ${defCount.n} requests, expected 5000 in 25`);
-  if (def.lines.length === 1 && def.lines[0].includes('JPMC') && def.lines[0].includes('max_pages=25')
-      && def.lines[0].includes('5000 of 7118') && def.lines[0].includes('raise max_pages') && def.result.oraclecloudTruncated === true) {
-    pass('oraclecloud.fetch() warns (entry, max_pages, N of M, how to raise) and tags the array when the cap cuts the board');
+  if (def.result.length === 7118 && defCount.n === 36 && def.lines.length === 0 && !def.result.truncated) {
+    pass('oraclecloud.fetch() with no max_pages follows the reported total past 25 pages (7118 in 36), silently');
   } else {
-    fail(`truncation warning wrong: ${JSON.stringify(def.lines)}`);
+    fail(`default with total: ${def.result.length} jobs in ${defCount.n} requests, warnings ${JSON.stringify(def.lines)}`);
+  }
+
+  // An explicit max_pages is the user's cap: it is not raised, and a cut says so.
+  const expCount = { n: 0 };
+  const exp = await captureWarn(() => oc.fetch({ name: 'JPMC', careers_url: careers, max_pages: 25 }, pagedCtx(7118, expCount)));
+  if (exp.result.length === 5000 && expCount.n === 25 && exp.lines.length === 1 && exp.lines[0].includes('JPMC')
+      && exp.lines[0].includes('max_pages=25') && exp.lines[0].includes('5000 of 7118') && exp.lines[0].includes('raise max_pages')
+      && exp.result.oraclecloudTruncated === true) {
+    pass('oraclecloud.fetch() keeps an explicit max_pages, warns (entry, max_pages, N of M, how to raise) and tags the cut');
+  } else {
+    fail(`explicit cap: ${exp.result.length} jobs in ${expCount.n} requests, warnings ${JSON.stringify(exp.lines)}`);
+  }
+
+  // No max_pages and a total beyond HARD_MAX_PAGES: read up to the ceiling and
+  // report the cut the same way a max_pages cut is reported.
+  const bigCount = { n: 0 };
+  const big = await captureWarn(() => oc.fetch({ name: 'Huge', careers_url: careers }, pagedCtx(50000, bigCount)));
+  if (bigCount.n === mod.HARD_MAX_PAGES && big.result.length === mod.HARD_MAX_PAGES * 200
+      && big.lines.length === 1 && big.lines[0].includes('ceiling') && big.lines[0].includes(`of 50000`)
+      && big.result.truncated?.reason === 'page-cap' && big.result.truncated?.total === 50000) {
+    pass('oraclecloud.fetch() with no max_pages stops at HARD_MAX_PAGES on a huge board and reports the truncation');
+  } else {
+    fail(`auto-raise ceiling: ${bigCount.n} requests, ${big.result.length} jobs, warnings ${JSON.stringify(big.lines)}, truncated ${JSON.stringify(big.result.truncated)}`);
+  }
+
+  // No max_pages and no reported total: the 25-page default still bounds the walk.
+  const ntdCount = { n: 0 };
+  const ntd = await captureWarn(() => oc.fetch({ name: 'NoTotalDefault', careers_url: careers }, {
+    transport: 'http', sleep: async () => {}, fetchText: async () => {},
+    fetchJson: async (url) => {
+      const offset = Number(new URL(url).searchParams.get('offset') || 0);
+      ntdCount.n++;
+      return { items: [{ requisitionList: Array.from({ length: 200 }, (_, i) => ({ Id: String(offset + i), Title: `T${offset + i}` })) }] };
+    },
+  }));
+  if (ntdCount.n === 25 && ntd.result.length === 5000 && ntd.lines.length === 1 && ntd.lines[0].includes('total unknown')) {
+    pass('oraclecloud.fetch() keeps the 25-page default when the tenant reports no total');
+  } else {
+    fail(`no-total default: ${ntdCount.n} requests, ${ntd.result.length} jobs, ${JSON.stringify(ntd.lines)}`);
   }
 
   const optCount = { n: 0 };
@@ -662,6 +776,48 @@ try {
     pass('oraclecloud.resolveMaxPages() defaults to 25, honours a positive integer, caps at HARD_MAX_PAGES');
   } else {
     fail('resolveMaxPages mapping wrong');
+  }
+
+  // ── oracle_host: an exact, opt-in branded host (Dell) ──────────────
+  {
+    const dell = {
+      name: 'Dell',
+      api: 'https://enterpriseplatform.dell.com/hcmUI/CandidateExperience/en/sites/CX_1001/jobs',
+      oracle_host: 'EnterprisePlatform.dell.com',
+    };
+    const site = resolveSite(dell);
+    site?.host === 'enterpriseplatform.dell.com' && site?.siteNumber === 'CX_1001'
+      ? pass('oraclecloud resolves a branded host named by oracle_host')
+      : fail(`oracle_host resolve: ${JSON.stringify(site)}`);
+
+    oc.detect(dell)?.url?.startsWith('https://enterpriseplatform.dell.com/hcmRestApi/')
+      && oc.detect({ name: 'Dell', api: dell.api }) === null
+      ? pass('oraclecloud.detect() claims a branded host only when oracle_host names it')
+      : fail(`oracle_host detect: ${JSON.stringify(oc.detect(dell))}`);
+
+    resolveSite({ name: 'Dell', api: dell.api }) === null
+      ? pass('oraclecloud still refuses a branded host without oracle_host')
+      : fail('branded host accepted without oracle_host');
+
+    resolveSite({ ...dell, oracle_host: 'other.dell.com' }) === null
+      ? pass('oraclecloud trusts only the exact oracle_host, not a sibling host')
+      : fail('oracle_host matched a different host');
+
+    resolveSite({ ...dell, oracle_host: '*.dell.com' }) === null
+      && resolveSite({ ...dell, oracle_host: 'https://enterpriseplatform.dell.com' }) === null
+      ? pass('oraclecloud rejects an oracle_host that is not one bare hostname')
+      : fail('malformed oracle_host accepted');
+
+    const calls = [];
+    const jobs = await oc.fetch(dell, {
+      fetchJson: async (url) => {
+        calls.push(url);
+        return { items: [{ TotalJobsCount: 1, requisitionList: [{ Id: '1', Title: 'Corporate Strategy Manager', PrimaryLocation: 'Round Rock, TX' }] }] };
+      },
+    });
+    jobs.length === 1 && calls.every((u) => hostOf(u) === 'enterpriseplatform.dell.com')
+      ? pass('oraclecloud fetches only from the pinned branded host')
+      : fail(`branded fetch: ${jobs.length} jobs, hosts=${calls.map(hostOf).join(',')}`);
   }
 
 } catch (e) {

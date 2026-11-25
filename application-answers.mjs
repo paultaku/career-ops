@@ -4,6 +4,7 @@ import { readFileSync, writeFileSync } from 'fs';
 import { resolve } from 'path';
 import { isMainModule } from './lib/is-main-module.mjs';
 import { localToday } from './lib/local-today.mjs';
+import { tryAcquireDirLockSync, releaseOrWarn } from './lib/dir-lock.mjs';
 
 export const APPLICATION_ANSWERS_HEADING = '## Application Answers';
 
@@ -401,10 +402,10 @@ function findDraftAnswersHeading(report) {
     h[1].replace(DRAFT_ANSWERS_MARKER_RE, '').replace(HEADING_PREFIX_RE, '').trim(),
   ));
   if (named) return named;
-  // Last resort, and the only path that reads a TRANSLATED heading (#4400).
-  // Neither rule above fires on one today: no mode emits the `(draft)` marker
-  // (`git grep '(draft)' -- 'modes/*'` is empty), and the name rule is the
-  // English words, which sixteen shipped modes translate (modes/es, modes/ru,
+  // Last resort, and the only path that reads a TRANSLATED heading written
+  // before the modes emitted the `(draft)` marker (#4272), which covers every
+  // report already on disk (#4400). The name rule above is the English words,
+  // which sixteen shipped modes translate (modes/es, modes/ru,
   // modes/tr, modes/zh, modes/zh-TW, and since #5843 the eleven that used to
   // write it under `G)`). For those the block silently returned null, which is
   // indistinguishable from a report that has no Block H.
@@ -501,10 +502,19 @@ export function upsertApplicationAnswersSection(reportText, snapshot = {}) {
   return updated.endsWith('\n') ? updated : `${updated}\n`;
 }
 
+const ANSWER_FLAGS = new Set([
+  '--help', '-h', '--read', '--read-draft', '--strict',
+  '--report', '--input', '--state', '--date',
+]);
+
 function parseArgs(argv) {
   const args = {};
   for (let i = 0; i < argv.length; i += 1) {
     const arg = argv[i];
+    if (arg.startsWith('-')) {
+      const name = arg.split('=')[0];
+      if (!ANSWER_FLAGS.has(name)) throw new Error(`Unrecognized flag: ${name}`);
+    }
     if (arg === '--help' || arg === '-h') args.help = true;
     else if (arg === '--read') args.read = true;
     else if (arg === '--read-draft') args.readDraft = true;
@@ -612,8 +622,14 @@ async function main() {
     state: args.state || input.state,
   };
   const reportPath = resolve(args.report);
-  const updated = upsertApplicationAnswersSection(readFileSync(reportPath, 'utf-8'), snapshot);
-  writeFileSync(reportPath, updated, 'utf-8');
+  const lock = tryAcquireDirLockSync(`${reportPath}.lock`, { staleMs: 30_000 });
+  if (!lock) throw new Error(`report is busy: ${reportPath}; retry saving the answers`);
+  try {
+    const updated = upsertApplicationAnswersSection(readFileSync(reportPath, 'utf-8'), snapshot);
+    writeFileSync(reportPath, updated, 'utf-8');
+  } finally {
+    releaseOrWarn(lock);
+  }
 
   const normalized = normalizeApplicationAnswersSnapshot(snapshot);
   console.log(JSON.stringify({ report: reportPath, date: normalized.date, state: normalized.state }, null, 2));

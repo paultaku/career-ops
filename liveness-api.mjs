@@ -36,6 +36,7 @@
  * (no slashes / traversal), and server-side redirects are refused.
  */
 
+import { resolveHimalayasPosting, retrieveHimalayasPosting } from './himalayas-posting.mjs';
 import { DEFAULT_USER_AGENT } from './user-agent.mjs';
 import { parseWwrFeed } from './providers/weworkremotely.mjs';
 import { hireHiveTenantOf } from './providers/hirehive.mjs';
@@ -98,6 +99,14 @@ function isSafeValue(v) {
 //   `api404Authoritative` — defaults to true (a 404/410 means gone). Set to
 //                  false when the provider's public API can 404 a posting that
 //                  is still genuinely live elsewhere (see the `lever` entry).
+const GREENHOUSE_BOARD_HOSTS = new Set([
+  'boards.greenhouse.io',
+  'boards.eu.greenhouse.io',
+  'job-boards.greenhouse.io',
+  'job-boards.eu.greenhouse.io',
+]);
+const SR_POSTING_PATH_RE = /^\/([^/]+)\/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}|[A-Za-z0-9]+)(?:-[^/]*)?\/?$/i;
+
 const ATS_PROVIDERS = [
   {
     id: 'greenhouse-embedded',
@@ -110,6 +119,11 @@ const ATS_PROVIDERS = [
     // which timed out or saw the id dropped by a redirect and answered uncertain.
     acceptsHttp: true,
     match(u) {
+      if (GREENHOUSE_BOARD_HOSTS.has(u.hostname)) {
+        if (u.protocol !== 'https:' || !/^\/embed\/job_app\/?$/.test(u.pathname) || u.searchParams.has('for')) return null;
+        const id = u.searchParams.get('token');
+        return id && /^\d+$/.test(id) ? { id } : null;
+      }
       if (/(^|\.)greenhouse\.io$/.test(u.hostname)) return null;
       const id = u.searchParams.get('gh_jid');
       return id && /^\d+$/.test(id) ? { id } : null;
@@ -130,23 +144,28 @@ const ATS_PROVIDERS = [
   },
   {
     id: 'greenhouse',
-    // boards.greenhouse.io/{board}/jobs/{id} · job-boards[.eu].greenhouse.io/{board}/jobs/{id}
+    // boards[.eu].greenhouse.io and job-boards[.eu].greenhouse.io: /{board}/jobs/{id} or /embed/job_app?for={board}&token={id}
     match(u) {
-      if (atsVendorOf(u.href) !== 'greenhouse') return null;
+      if (!GREENHOUSE_BOARD_HOSTS.has(u.hostname)) return null;
       const m = u.pathname.match(/^\/([^/]+)\/jobs\/(\d+)\/?$/);
-      return m ? { board: m[1], id: m[2] } : null;
+      if (m && m[1].toLowerCase() !== 'embed') return { board: m[1], id: m[2] };
+      if (!/^\/embed\/job_app\/?$/.test(u.pathname)) return null;
+      const board = u.searchParams.get('for');
+      const id = u.searchParams.get('token');
+      return board && !board.includes('/') && id && /^\d+$/.test(id) ? { board, id } : null;
     },
     api: ({ board, id }) => `https://boards-api.greenhouse.io/v1/boards/${board}/jobs/${id}`,
   },
   {
     id: 'lever',
-    // jobs.(eu.)?lever.co/{slug}/{id}
+    // jobs.(eu.)?lever.co/{slug}/{id}[/apply]
     match(u) {
       if (atsVendorOf(u.href) !== 'lever') return null;
       const host = u.hostname.match(/^jobs\.((?:eu\.)?lever\.co)$/);
       if (!host) return null;
-      const m = u.pathname.match(/^\/([^/]+)\/([^/?#]+)\/?$/);
-      return m ? { apiHost: `api.${host[1]}`, slug: m[1], id: m[2] } : null;
+      const m = u.pathname.match(/^\/([^/]+)\/([^/?#]+)(?:\/apply)?\/?$/);
+      if (!m || m[2].toLowerCase() === 'apply') return null;
+      return { apiHost: `api.${host[1]}`, slug: m[1], id: m[2] };
     },
     api: ({ apiHost, slug, id }) => `https://${apiHost}/v0/postings/${slug}/${id}`,
     // Lever's Confidential/Internal Postings feature explicitly excludes some
@@ -159,11 +178,16 @@ const ATS_PROVIDERS = [
   },
   {
     id: 'workable',
-    // apply.workable.com/{account}/j/{shortcode}
+    // apply.workable.com/{account}/j/{shortcode}[/apply] or /{account}/jobs/view/{shortcode}
     match(u) {
       if (u.hostname !== 'apply.workable.com') return null;
-      const m = u.pathname.match(/^\/([^/]+)\/j\/([A-Za-z0-9_-]+)\/?$/);
-      return m ? { account: m[1], shortcode: m[2] } : null;
+      const m = u.pathname.match(/^\/([^/]+)\/(?:j\/([A-Za-z0-9_-]+)(?:\/apply)?|jobs\/view\/([A-Za-z0-9_-]+))\/?$/);
+      if (!m) return null;
+      const lower = m[1].toLowerCase();
+      if (lower === 'j' || lower === 'api') return null;
+      const shortcode = m[2] || m[3];
+      if (shortcode.toLowerCase() === 'apply') return null;
+      return { account: m[1], shortcode };
     },
     api: ({ account, shortcode }) => `https://apply.workable.com/api/v2/accounts/${account}/jobs/${shortcode}`,
     // Workable's posting pages render client-side, so the browser rung reads a
@@ -181,13 +205,14 @@ const ATS_PROVIDERS = [
   },
   {
     id: 'workable-short',
-    // apply.workable.com/j/{shortcode} is the share link, and it carries no
+    // apply.workable.com/j/{shortcode}[/apply] is the share link, and it carries no
     // account. Following its own redirect yields /{account}/j/{shortcode},
     // which names the account the v2 endpoint needs (#5000).
     match(u) {
       if (u.hostname !== 'apply.workable.com') return null;
-      const m = u.pathname.match(/^\/j\/([A-Za-z0-9_-]+)\/?$/);
-      return m ? { shortcode: m[1] } : null;
+      const m = u.pathname.match(/^\/j\/([A-Za-z0-9_-]+)(?:\/apply)?\/?$/);
+      if (!m || m[1].toLowerCase() === 'apply') return null;
+      return { shortcode: m[1] };
     },
     api: ({ shortcode }) => `https://apply.workable.com/j/${shortcode}`,
     async followEmbed(res, { shortcode }) {
@@ -245,6 +270,7 @@ const ATS_PROVIDERS = [
   {
     id: 'workday',
     // {tenant}.{shard}.myworkdayjobs.com[/{xx-XX}]/{site}/job/{jobPath...}
+    // {shard}.myworkdaysite.com[/{xx-XX}]/recruiting/{tenant}/{site}/job/{jobPath...}
     // Mirrors the tenant/shard/site detection in providers/workday.mjs, but for a
     // single posting rather than the board-wide CXS search endpoint. Workday's
     // per-job CXS endpoint (`/wday/cxs/{tenant}/{site}/job/{jobPath}`) is a
@@ -259,15 +285,23 @@ const ATS_PROVIDERS = [
     // it component-by-component.
     match(u) {
       if (atsVendorOf(u.href) !== 'workday') return null;
-      const m = `${u.hostname}${u.pathname}`.match(
+      const jobs = `${u.hostname}${u.pathname}`.match(
         /^([\w-]+)\.(wd[\w-]*)\.myworkdayjobs\.com\/(?:[a-z]{2}-[A-Z]{2}\/)?([^/?#]+)\/job\/(.+?)\/?$/
       );
-      if (!m) return null;
-      const [, tenant, shard, site, jobPath] = m;
-      return { tenant, shard, site, jobPath };
+      if (jobs) {
+        const [, tenant, shard, site, jobPath] = jobs;
+        return { hostKind: 'jobs', tenant, shard, site, jobPath };
+      }
+      const siteMatch = `${u.hostname}${u.pathname}`.match(
+        /^(wd[\w-]*)\.myworkdaysite\.com\/(?:[a-z]{2}-[A-Z]{2}\/)?recruiting\/([\w-]+)\/([^/?#]+)\/job\/(.+?)\/?$/
+      );
+      if (!siteMatch) return null;
+      const [, shard, tenant, site, jobPath] = siteMatch;
+      return { hostKind: 'site', tenant: tenant.toLowerCase(), shard, site, jobPath };
     },
-    api: ({ tenant, shard, site, jobPath }) =>
-      `https://${tenant}.${shard}.myworkdayjobs.com/wday/cxs/${tenant}/${site}/job/${jobPath}`,
+    api: ({ hostKind, tenant, shard, site, jobPath }) => hostKind === 'site'
+      ? `https://${shard}.myworkdaysite.com/wday/cxs/${tenant}/${site}/job/${jobPath}`
+      : `https://${tenant}.${shard}.myworkdayjobs.com/wday/cxs/${tenant}/${site}/job/${jobPath}`,
     interpretStatuses: [403],
     async interpret(res) {
       let json;
@@ -283,15 +317,22 @@ const ATS_PROVIDERS = [
     id: 'smartrecruiters',
     match(u) {
       if (u.hostname !== 'jobs.smartrecruiters.com') return null;
-      const m = u.pathname.match(/^\/([^/]+)\/([A-Za-z0-9]+)(?:-[^/]*)?\/?$/);
-      return m ? { company: m[1], id: m[2] } : null;
+      const m = u.pathname.match(SR_POSTING_PATH_RE);
+      if (!m) return null;
+      const id = m[2].includes('-') ? m[2].toLowerCase() : m[2];
+      return { company: m[1], id };
     },
     api: ({ company, id }) => `https://api.smartrecruiters.com/v1/companies/${company}/postings/${id}`,
     api404Authoritative: false, // the API also uses 400 for unknown IDs
     async interpret(res, { id }) {
       let posting;
       try { posting = await res.json(); } catch { return null; }
-      if (String(posting?.id) !== id || typeof posting.active !== 'boolean') return null;
+      const postingId = posting?.id == null ? '' : String(posting.id);
+      const postingUuid = posting?.uuid == null ? '' : String(posting.uuid);
+      const sameId = id.includes('-')
+        ? postingUuid.toLowerCase() === id || postingId.toLowerCase() === id
+        : postingId === id;
+      if (!sameId || typeof posting.active !== 'boolean') return null;
       return posting.active
         ? { result: 'active', code: 'smartrecruiters_api_active', reason: 'SmartRecruiters marks the posting active' }
         : { result: 'expired', code: 'smartrecruiters_api_inactive', reason: 'SmartRecruiters marks the posting inactive' };
@@ -1129,7 +1170,8 @@ export function isAtsPosting(url) {
 // description, responsibilities, requirements and benefits.
 // Workable canonical and share links expose description, requirements and benefits
 // on the per-posting v2 API, after the existing guarded account-resolution hop.
-// HireHive's per-posting API carries the description HTML.
+// HireHive, BambooHR and Himalayas expose the description in per-posting APIs.
+// The last two also have JD-specific routes in resolveJdApi().
 // Microsoft and LinkedIn are on ATS_PROVIDERS
 // for liveness only — their public endpoints answer search/status, never body
 // text — so they are deliberately excluded here; see fetch-jd.mjs / the
@@ -1139,9 +1181,11 @@ export function isAtsPosting(url) {
 // touch different lines, which reduces merge conflicts.
 export const JD_TEXT_API_ATS = new Set([
   'ashby',
+  'bamboohr',
   'greenhouse',
   'greenhouse-embedded',
   'hibob',
+  'himalayas',
   'hirehive',
   'lever',
   'smartrecruiters',
@@ -1167,6 +1211,18 @@ export const JD_TEXT_API_ATS = new Set([
  *   and could not read it, and no other rung would do better.
  */
 export async function checkLivenessViaApi(url, { boardCache } = {}) {
+  // Himalayas is not an ATS, but it publishes a single-job API (himalayas-posting.mjs,
+  // #6501). Its pages sit behind a Cloudflare challenge, so the browser rung
+  // could only report a challenge, and its headed retry put that challenge in
+  // front of the user. The API answers instead: a documented 410 closes the
+  // posting, a 200 for this exact posting is live, and anything else (404,
+  // transport, partial payload) stays inconclusive for the browser to try.
+  if (resolveHimalayasPosting(url)) {
+    const h = await retrieveHimalayasPosting(url);
+    if (h.publisherStatus === 'open') return { result: 'active', code: 'himalayas_publisher_open', reason: 'Himalayas API: posting is listed' };
+    if (h.publisherStatus === 'closed') return { result: 'expired', code: 'himalayas_closed', reason: 'Himalayas API 410: posting expired' };
+    return null;
+  }
   const resolved = resolveAtsApi(url);
   if (!resolved) return null;
   const { ats, apiUrl, method, body, parts, interpret, interpretStatuses, timeoutMs, throttleMs, accept, headers, followEmbed, api404Authoritative, interpretBoard } = resolved;

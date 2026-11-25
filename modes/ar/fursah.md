@@ -253,7 +253,7 @@
 ## Risk Summary
 (سطر واحد لكل إشارة مخاطر، بترتيب ثابت — راجع قسم Risk Summary أعلاه)
 
-## H) Draft Application Answers
+## H) Draft Application Answers (draft)
 (يُكتب فقط إذا كان التقييم الإجمالي للمطابقة 4.5 فما فوق — مسودات إجابات جاهزة ومقترحة لنموذج التقديم)
 
 ---
@@ -262,7 +262,7 @@
 (قائمة تحتوي على 15-20 كلمة مفتاحية مستخرجة من الـ JD ومهمة لتحسين الـ ATS)
 
 ## Keyword Coverage
-(يُنشئه `keyword-match.mjs` (1b) — نسبة التغطية، present، thin، missing)
+(يُنشئه `keyword-match.mjs` (1b) — نسبة التغطية، present، missing)
 
 ## Job Description (archived verbatim)
 (النص الكامل لإعلان الوظيفة، يُلصق حرفياً — انظر المتطلب أدناه)

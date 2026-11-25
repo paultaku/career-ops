@@ -239,7 +239,7 @@ Header के field names (`Date`, `URL`, `Archetype`, `Score`, `Legitimacy`, `P
 ## Score Evidence
 (पाँच dimensions, evidence status, open questions, Evidence confidence, priorities)
 
-## H) Application के लिए Draft Responses
+## H) Application के लिए Draft Responses (draft)
 (केवल यदि score >= 4.5 -- application form के लिए draft responses)
 
 ---
@@ -248,7 +248,7 @@ Header के field names (`Date`, `URL`, `Archetype`, `Score`, `Legitimacy`, `P
 (ATS optimization के लिए offer के 15-20 keywords की list)
 
 ## Keyword Coverage
-(`keyword-match.mjs` (1b) से generated -- coverage %, present, thin, missing)
+(`keyword-match.mjs` (1b) से generated -- coverage %, present, missing)
 
 ## Job Description (archived verbatim)
 (offer का पूरा text, word-for-word paste किया हुआ -- नीचे requirement देखें)

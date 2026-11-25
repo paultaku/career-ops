@@ -16,25 +16,42 @@
  * Each new row is assigned the next unused numeric id (source is "pipeline").
  *
  * Deduplicates against existing batch-input.tsv entries and batch-state.tsv
- * (already-processed URLs). Idempotent: safe to run repeatedly.
+ * (already-processed URLs). Before ids are assigned it also drops an aggregator
+ * row (LinkedIn, Indeed, ...) whose company and title exactly match another
+ * Pending row, so one job is not scored twice (#7259). Idempotent: safe to run repeatedly.
  * Read-only over the pipeline; the only write is appending to batch-input.tsv.
+ *
+ * --url <url> queues that one Pending row instead of all of them, with the same
+ * normalization, dedupe, id allocation, lock and row format (#5269; the
+ * dashboard's Inbox `e` key calls it). With --url the exit status says what
+ * happened, so a caller need not read the output:
+ *   0  the row was queued (or, with --dry-run, would be)
+ *   3  nothing to queue: the URL is already in batch-input.tsv or batch-state.tsv
+ *   4  the URL is not an unchecked Pending row this script can read (its URL
+ *      must be the first cell after "- [ ] ")
+ *   1  any other error, such as a --url that is not a public http(s) URL
+ * Without --url a run with nothing to add still exits 0.
  *
  * The "Pending" section heading is read in every language a mode writes it
  * in (lib/pipeline-sections.mjs, shared with reconcile-pipeline.mjs and scan.mjs).
  *
- * Run: node sync-batch-input.mjs [--dry-run] [--pipeline <path>] [--input <path>] [--state <path>]
+ * Run: node sync-batch-input.mjs [--dry-run] [--url <url>] [--pipeline <path>] [--input <path>] [--state <path>]
  */
 
 import { readFileSync, writeFileSync, existsSync, appendFileSync, mkdirSync, realpathSync, lstatSync } from 'fs';
 import { join, dirname, resolve, relative, isAbsolute } from 'path';
 import { fileURLToPath } from 'url';
 import { isIP } from 'net';
+import { isBlockedAddress } from './providers/_ip-guard.mjs';
 import { tmpdir } from 'os';
 import { createHash } from 'crypto';
 import { isMainModule } from './lib/is-main-module.mjs';
 import { flagValue, hasFlag, validateFlags } from './lib/cli-flags.mjs';
 import { getCareerOpsRoot } from './path-resolver.mjs';
 import { sectionKind } from './lib/pipeline-sections.mjs';
+import { isAggregatorUrl } from './url-key.mjs';
+import { normalizeCompany } from './tracker-utils.mjs';
+import { normalizeTextKey } from './tracker-parse.mjs';
 import { acquirePipelineLock } from './pipeline-lock.mjs';
 import { releaseOrWarn } from './lib/dir-lock.mjs';
 
@@ -43,6 +60,9 @@ const CHECKOUT_ROOT = dirname(fileURLToPath(import.meta.url));
 
 /** Batch source label written into the source column. */
 export const SOURCE = 'pipeline';
+
+/** Exit statuses of a --url run besides 0 (queued) and 1 (error). */
+export const URL_EXIT = Object.freeze({ ALREADY_QUEUED: 3, NOT_PENDING: 4 });
 
 function canonicalInputPath(inputPath) {
   let existing = inputPath;
@@ -94,74 +114,22 @@ function parseIpv4Hostname(host) {
   return nums;
 }
 
-function ipv4FromLow32(high, lowBits) {
-  if (high > 0xffff || lowBits > 0xffff) return null;
-  return [(high >>> 8) & 255, high & 255, (lowBits >>> 8) & 255, lowBits & 255];
-}
-
-function parseIpv4MappedIpv6(host) {
-  const normalized = String(host || '').toLowerCase();
-  const dotted = normalized.match(/^(?:0:0:0:0:0:ffff:|::ffff:)(\d{1,3}(?:\.\d{1,3}){3})$/);
-  if (dotted) return parseIpv4Hostname(dotted[1]);
-  const hex = normalized.match(/^(?:0:0:0:0:0:ffff:|::ffff:)([0-9a-f]{1,4}):([0-9a-f]{1,4})$/);
-  if (!hex) return null;
-  return ipv4FromLow32(Number.parseInt(hex[1], 16), Number.parseInt(hex[2], 16));
-}
-
-// IPv4-compatible IPv6 (::a.b.c.d or ::h1:h2), where the low 32 bits encode an
-// IPv4 address. Rejects loopback/private destinations that new URL() normalizes
-// into this form (e.g. http://[::127.0.0.1]/ -> [::7f00:1] -> 127.0.0.1).
-function parseIpv4CompatibleIpv6(host) {
-  const bounded = String(host || '').toLowerCase();
-  const dotted = bounded.match(/^::(\d{1,3}(?:\.\d{1,3}){3})$/);
-  if (dotted) return parseIpv4Hostname(dotted[1]);
-  const hex = bounded.match(/^::([0-9a-f]{1,4}):([0-9a-f]{1,4})$/);
-  if (!hex) return null;
-  return ipv4FromLow32(Number.parseInt(hex[1], 16), Number.parseInt(hex[2], 16));
-}
-
-function isPrivateIpv4(parts) {
-  const [a, b] = parts;
-  return (
-    a === 0 ||
-    a === 10 ||
-    a === 127 ||
-    (a === 100 && b >= 64 && b <= 127) ||
-    (a === 169 && b === 254) ||
-    (a === 172 && b >= 16 && b <= 31) ||
-    (a === 192 && b === 168) ||
-    (a === 198 && (b === 18 || b === 19)) ||
-    a >= 224
-  );
-}
-
+// An IP literal is judged by the providers' address list
+// (providers/_ip-guard.mjs isBlockedAddress), the one the batch prefetch and
+// every fetcher use, so a URL this lets into batch-input.tsv is one they would
+// fetch. Names keep this file's stricter rules.
 function isPrivateOrInternalHostname(hostname) {
   const host = String(hostname || '').toLowerCase().replace(/^\[|\]$/g, '');
   if (!host) return true;
   if (host === ':' || host === '::') return true;
-  // Reject the unspecified IPv6 address (::), including hex form.
-  if (host === '::' || host === '0:0:0:0:0:0:0:0') return true;
   if (host === 'localhost' || host.endsWith('.localhost')) return true;
   if (!host.includes('.') && isIP(host) === 0) return true;
   if (/\.(?:local|internal|lan|home|test|invalid)$/i.test(host)) return true;
 
   const ipv4 = parseIpv4Hostname(host);
-  if (ipv4) return isPrivateIpv4(ipv4);
-
-  const version = isIP(host);
-  if (version !== 6) return false;
-  if (host === '::1' || host === '0:0:0:0:0:0:0:1') return true;
-
-  const mappedIpv4 = parseIpv4MappedIpv6(host);
-  if (mappedIpv4) return isPrivateIpv4(mappedIpv4);
-
-  const compatIpv4 = parseIpv4CompatibleIpv6(host);
-  if (compatIpv4) return isPrivateIpv4(compatIpv4);
-
-  const firstHextet = host.split(':')[0];
-  if (/^f[cd][0-9a-f]{0,2}$/i.test(firstHextet)) return true;
-  const first = Number.parseInt(firstHextet, 16);
-  return Number.isFinite(first) && first >= 0xfe80 && first <= 0xfebf;
+  if (ipv4) return isBlockedAddress(ipv4.join('.'));
+  if (isIP(host) === 6) return isBlockedAddress(new URL(`http://[${host}]/`).hostname.slice(1, -1));
+  return false;
 }
 
 /**
@@ -197,6 +165,9 @@ export function extractLabels(body) {
   return labels;
 }
 
+// A labeled segment (see extractLabels) is never a positional company or title cell.
+const LABEL_CELL_RE = /^(?:posted|trust|yrs|note|rank):/;
+
 /**
  * Extract the company name (positional 2nd cell) from a pipeline row body.
  * @param {string} body - Raw pipeline row body.
@@ -204,7 +175,17 @@ export function extractLabels(body) {
  */
 export function lineCompany(body) {
   const parts = body.split('|').map((s) => s.trim());
-  return parts.length > 1 ? parts[1] || '' : '';
+  return parts.length > 1 && !LABEL_CELL_RE.test(parts[1]) ? parts[1] : '';
+}
+
+/**
+ * Extract the job title (positional 3rd cell) from a pipeline row body.
+ * @param {string} body - Raw pipeline row body.
+ * @returns {string}
+ */
+export function lineTitle(body) {
+  const parts = body.split('|').map((s) => s.trim());
+  return parts.length > 2 && !LABEL_CELL_RE.test(parts[2]) ? parts[2] : '';
 }
 
 /**
@@ -219,7 +200,7 @@ export function buildNotes(labels) {
 /**
  * Parse pending entries out of raw pipeline.md text (mirrors reconcile-pipeline.mjs).
  * @param {string} text - Raw pipeline.md contents.
- * @returns {Array<{url:string, company:string, notes:string}>}
+ * @returns {Array<{url:string, company:string, title:string, notes:string}>}
  */
 export function parsePending(text) {
   const lines = text.split(/\r?\n/);
@@ -241,7 +222,7 @@ export function parsePending(text) {
     const raw = lineUrl(body);
     if (!isSafePublicHttpUrl(raw)) continue;
     const url = new URL(raw).href;
-    out.push({ url, company: lineCompany(body), notes: buildNotes(extractLabels(body)) });
+    out.push({ url, company: lineCompany(body), title: lineTitle(body), notes: buildNotes(extractLabels(body)) });
   }
   return out;
 }
@@ -289,6 +270,36 @@ export function maxTsvId(text) {
 }
 
 /**
+ * Drop aggregator rows that repeat a job another Pending row already carries.
+ * Rows match on an exact normalized company plus title; a row missing either is
+ * never matched. In a group with an employer-hosted row every aggregator row
+ * goes; an aggregator-only group keeps its first row. Employer rows are never
+ * dropped here, and input order is kept (#7259).
+ * @param {Array<{url:string, company:string, title?:string}>} pending
+ * @returns {Array<{url:string, company:string, title?:string}>}
+ */
+export function dropAggregatorDuplicates(pending) {
+  const keyOf = (e) => {
+    const company = normalizeCompany(e.company);
+    const title = normalizeTextKey(e.title, ' ');
+    return company && title ? `${company}\t${title}` : null;
+  };
+  const hasEmployer = new Set();
+  for (const e of pending) {
+    const key = keyOf(e);
+    if (key && !isAggregatorUrl(e.url)) hasEmployer.add(key);
+  }
+  const keptAggregator = new Set();
+  return pending.filter((e) => {
+    const key = keyOf(e);
+    if (!key || !isAggregatorUrl(e.url)) return true;
+    if (hasEmployer.has(key) || keptAggregator.has(key)) return false;
+    keptAggregator.add(key);
+    return true;
+  });
+}
+
+/**
  * Build the final batch-input.tsv rows for the pending entries not already queued
  * or processed. Each row is id<tab>url<tab>source<tab>notes with a numeric id
  * allocated sequentially starting at `startId`.
@@ -315,9 +326,12 @@ export function planBatchRows(pending, existingUrls, startId = 1) {
 
 if (isMainModule(import.meta.url)) {
   const args = process.argv.slice(2);
-  const USAGE = 'Usage: node sync-batch-input.mjs [--dry-run] [--pipeline <path>] [--input <path>] [--state <path>]\n'
-    + '  Syncs pipeline.md "Pending" entries into batch/batch-input.tsv.';
-  const VALUE_FLAGS = ['--pipeline', '--input', '--state'];
+  const USAGE = 'Usage: node sync-batch-input.mjs [--dry-run] [--url <url>] [--pipeline <path>] [--input <path>] [--state <path>]\n'
+    + '  Syncs pipeline.md "Pending" entries into batch/batch-input.tsv.\n'
+    + '  --url <url>  queue only the Pending row with this posting URL. Exit status:\n'
+    + '               0 queued, 3 already in batch-input.tsv or batch-state.tsv (nothing to queue),\n'
+    + '               4 not an unchecked Pending row whose URL is the first cell after "- [ ] ", 1 other errors.';
+  const VALUE_FLAGS = ['--pipeline', '--input', '--state', '--url'];
   // A mistyped --dry-run must not fall through to a real write, and --input=path
   // must not be dropped in favour of the default file.
   validateFlags(args, ['--dry-run', ...VALUE_FLAGS, '--help', '-h'], USAGE, { valueFlags: VALUE_FLAGS, requireOperand: true });
@@ -353,13 +367,35 @@ if (isMainModule(import.meta.url)) {
   const INPUT_FILE = canonicalInputPath(inputPath);
   const STATE_FILE = resolveInsideRepo(argValue('--state'), join(CHECKOUT_ROOT, 'batch', 'batch-state.tsv'), '--state', CHECKOUT_ROOT);
 
+  // --url: normalized the way parsePending normalizes each row, so the match
+  // and the dedupe below compare the same form of the URL.
+  const urlArg = argValue('--url');
+  let ONLY_URL = null;
+  if (urlArg !== null) {
+    if (!isSafePublicHttpUrl(urlArg)) {
+      console.error(`--url must be a public http(s) URL: ${urlArg}`);
+      process.exit(1);
+    }
+    ONLY_URL = new URL(urlArg).href;
+  }
+  const notPending = () => {
+    console.error(`Not an unchecked Pending row in ${PIPELINE_FILE}: ${ONLY_URL} (the URL must be the first cell after "- [ ] ")`);
+    process.exit(URL_EXIT.NOT_PENDING);
+  };
+
   if (!existsSync(PIPELINE_FILE)) {
+    if (ONLY_URL) notPending();
     console.log('No pipeline.md found — nothing to sync.');
     process.exit(0);
   }
 
-  const pending = parsePending(readFileSync(PIPELINE_FILE, 'utf-8'));
+  const allPending = parsePending(readFileSync(PIPELINE_FILE, 'utf-8'));
+  // The first matching row wins, as it does in planBatchRows.
+  const selected = ONLY_URL ? allPending.filter((e) => e.url === ONLY_URL).slice(0, 1) : allPending;
+  const pending = dropAggregatorDuplicates(selected);
+  const droppedAggregators = selected.length - pending.length;
   if (pending.length === 0) {
+    if (ONLY_URL) notPending();
     console.log('No valid pending entries found — nothing to sync.');
     process.exit(0);
   }
@@ -384,13 +420,18 @@ if (isMainModule(import.meta.url)) {
 
     const newRows = planBatchRows(pending, existingUrls, startId);
     if (newRows.length === 0) {
+      if (ONLY_URL) {
+        console.log(`${ONLY_URL} is already in batch-input.tsv or batch-state.tsv — nothing to queue.`);
+        process.exit(URL_EXIT.ALREADY_QUEUED);
+      }
       console.log(`All ${pending.length} pending entries already in batch-input.tsv or batch-state.tsv — nothing to sync.`);
       process.exit(0);
     }
 
     console.log('=== Sync pipeline.md -> batch-input.tsv ===');
-    console.log(`📋 Pipeline pending: ${pending.length} entries`);
+    console.log(ONLY_URL ? `📋 Pipeline pending: ${allPending.length} entries, 1 selected with --url` : `📋 Pipeline pending: ${pending.length} entries`);
     console.log(`⏭️  Already queued/processed: ${pending.length - newRows.length}`);
+    if (droppedAggregators > 0) console.log(`🔁 Dropped ${droppedAggregators} aggregator duplicate${droppedAggregators === 1 ? '' : 's'} of a pending job`);
     console.log(`➕ New entries to add: ${newRows.length}`);
     for (const e of newRows) {
       const label = e.company ? ` (${e.company})` : '';
