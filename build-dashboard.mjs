@@ -24,7 +24,9 @@ function goFloor() {
   }
 }
 
-const result = spawnSync('go', ['build', '-o', out, '.'], {
+// -buildvcs=false matches DOCKER.md and avoids "error obtaining VCS status"
+// when git stamping fails (dirty/unowned trees, sandboxes, etc.).
+const result = spawnSync('go', ['build', '-buildvcs=false', '-o', out, '.'], {
   cwd: join(root, 'dashboard'),
   stdio: 'inherit',
 });

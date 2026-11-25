@@ -3536,7 +3536,7 @@ function rebuildDashboardBinaryIfNeeded() {
 
   const binary = dashboardBinaryName();
   try {
-    execFileSync('go', ['build', '-o', binary, '.'], {
+    execFileSync('go', ['build', '-buildvcs=false', '-o', binary, '.'], {
       cwd: join(ROOT, 'dashboard'),
       timeout: DASHBOARD_REBUILD_TIMEOUT_MS,
       stdio: 'pipe',
